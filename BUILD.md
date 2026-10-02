@@ -116,6 +116,28 @@ bun run tauri build
 
 This compiles a release binary and generates platform-specific bundles (deb, rpm, AppImage on Linux; dmg on macOS; msi on Windows).
 
+### Personal macOS Build
+
+Build a local app without the official updater signing key:
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 bun run tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+The app is at `src-tauri/target/release/bundle/macos/Handy.app`. Turn off update checks in Advanced settings when using a personal fork.
+
+On Apple Silicon, a macOS 26 or newer SDK enables Apple Intelligence with Command Line Tools or Xcode. Guided generation uses a runtime schema without compiler macros.
+
+Run the Japanese cleanup checks against the real on-device model:
+
+```bash
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked \
+  --manifest-path src-tauri/Cargo.toml --lib \
+  japanese_dictation_uses_real_apple_intelligence -- --ignored --nocapture
+```
+
+This opt-in test requires Apple Intelligence to be available and exercises the real post-processing path, including the original-text fallback. Normal test runs skip it.
+
 ## Linux Install (from source)
 
 The raw binary (`src-tauri/target/release/handy`) cannot run standalone — it needs Tauri resource files (tray icons, sounds, VAD model) to be co-located at the expected path.

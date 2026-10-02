@@ -155,6 +155,10 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
   const selectedPromptId = getSetting("post_process_selected_prompt_id") || "";
   const selectedPrompt =
     prompts.find((prompt) => prompt.id === selectedPromptId) || null;
+  const promptName = (prompt: { id: string; name: string }) =>
+    prompt.id === "japanese_dictation" && prompt.name === "Japanese Dictation"
+      ? t("settings.postProcessing.prompts.japaneseDictation")
+      : prompt.name;
 
   useEffect(() => {
     if (isCreating) return;
@@ -263,7 +267,7 @@ const PostProcessingSettingsPromptsComponent: React.FC = () => {
             selectedValue={selectedPromptId || null}
             options={prompts.map((p) => ({
               value: p.id,
-              label: p.name,
+              label: promptName(p),
             }))}
             onSelect={(value) => handlePromptSelect(value)}
             placeholder={

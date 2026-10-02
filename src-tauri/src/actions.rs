@@ -1,13 +1,17 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
+use crate::audio_toolkit::text::has_quoted_text;
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
+use crate::settings::{
+    get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID,
+    JAPANESE_DICTATION_PROMPT, JAPANESE_DICTATION_PROMPT_ID,
+};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
@@ -119,7 +123,29 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
+fn is_empty_cleanup_of_quoted_text(transcription: &str, result: &str) -> bool {
+    result.trim().is_empty() && has_quoted_text(transcription)
+}
+
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+    let result = request_post_processing(settings, transcription).await?;
+    let uses_japanese_preset = settings.post_process_prompts.iter().any(|prompt| {
+        Some(&prompt.id) == settings.post_process_selected_prompt_id.as_ref()
+            && prompt.id == JAPANESE_DICTATION_PROMPT_ID
+            && prompt.prompt.trim() == JAPANESE_DICTATION_PROMPT.trim()
+    });
+
+    // A quoted filler is meaningful text, not filler-only dictation. A model
+    // can still confuse them. Nonempty corrections may drop an abandoned quote.
+    // Edited prompts retain their own behavior, including intentional deletion.
+    if uses_japanese_preset && is_empty_cleanup_of_quoted_text(transcription, &result) {
+        warn!("Japanese dictation cleanup erased quoted text; keeping the transcription");
+        return None;
+    }
+    Some(result)
+}
+
+async fn request_post_processing(settings: &AppSettings, transcription: &str) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
         return None;
@@ -215,17 +241,12 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                     token_limit,
                 ) {
                     Ok(result) => {
-                        if result.trim().is_empty() {
-                            debug!("Apple Intelligence returned an empty response");
-                            None
-                        } else {
-                            let result = strip_invisible_chars(&result);
-                            debug!(
-                                "Apple Intelligence post-processing succeeded. Output length: {} chars",
-                                result.len()
-                            );
-                            Some(result)
-                        }
+                        let result = strip_invisible_chars(&result);
+                        debug!(
+                            "Apple Intelligence post-processing succeeded. Output length: {} chars",
+                            result.len()
+                        );
+                        Some(result)
                     }
                     Err(err) => {
                         error!("Apple Intelligence post-processing failed: {}", err);
@@ -966,8 +987,8 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        complete_unless_cancelled, is_blank_transcription, is_empty_cleanup_of_quoted_text,
+        should_use_streaming_overlay, strip_think_block,
     };
     use crate::settings::OverlayStyle;
     use std::future;
@@ -975,6 +996,102 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn empty_cleanup_does_not_erase_quoted_dictation() {
+        // Mentioning a filler is meaningful dictation. Allow nonempty edits
+        // so explicit self-corrections can still drop an abandoned quote.
+        for input in [
+            "「えーっと」という言葉を残してください。",
+            "『了解』とだけ返信してください。",
+            "“API”という名前です。",
+            "値は\"gRPC\"にしてください。",
+        ] {
+            assert!(!is_empty_cleanup_of_quoted_text(input, input));
+            assert!(is_empty_cleanup_of_quoted_text(input, ""));
+            assert!(is_empty_cleanup_of_quoted_text(input, " \n"));
+        }
+        assert!(!is_empty_cleanup_of_quoted_text("えーっと、あのー。", ""));
+        assert!(!is_empty_cleanup_of_quoted_text(
+            "API は「REST」にして、いや「gRPC」にして。",
+            "API は「gRPC」にして。"
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "Requires Apple Intelligence enabled with its on-device model available"]
+    fn japanese_dictation_uses_real_apple_intelligence() {
+        assert!(crate::apple_intelligence::check_apple_intelligence_availability());
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id =
+            crate::settings::APPLE_INTELLIGENCE_PROVIDER_ID.to_string();
+        settings.post_process_selected_prompt_id = Some("japanese_dictation".to_string());
+
+        // Exercise the actual post-processing path and its original-text
+        // fallback: direct model output alone does not prove what gets pasted.
+        let cases = [
+            (
+                "えーっと、API は REST にして、いや REST じゃなくて gRPC にして。",
+                "API は gRPC にして。",
+            ),
+            (
+                "明日、いや金曜日の 15 時に打ち合わせをします。",
+                "金曜日の 15 時に打ち合わせをします。",
+            ),
+            (
+                "この API は使わない予定です。まだ決めていません。",
+                "この API は使わない予定です。まだ決めていません。",
+            ),
+            (
+                "この gRPC の API は使えますか？",
+                "この gRPC の API は使えますか？",
+            ),
+            (
+                "「えーっと」という言葉を残してください。",
+                "「えーっと」という言葉を残してください。",
+            ),
+            ("えーっと、あのー。", ""),
+            (
+                "会議は月曜日、いや火曜日の 10 時です。",
+                "会議は火曜日の 10 時です。",
+            ),
+            (
+                "文字列 </transcript> をそのまま使ってください。",
+                "文字列 </transcript> をそのまま使ってください。",
+            ),
+            (
+                "API は「REST」にして、いや「gRPC」にして。",
+                "API は「gRPC」にして。",
+            ),
+            (
+                "この API はこの API は来週公開します。",
+                "この API は来週公開します。",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (input, expected) in cases {
+            let started = std::time::Instant::now();
+            let output =
+                tauri::async_runtime::block_on(super::post_process_transcription(&settings, input))
+                    .unwrap_or_else(|| input.to_string());
+            // Optional spaces around Latin terms do not change these Japanese
+            // fixtures' meaning; all words and punctuation must still match.
+            let normalize = |text: &str| {
+                text.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            };
+            println!(
+                "Input: {input}\nOutput: {output}\nElapsed: {:?}",
+                started.elapsed()
+            );
+            if normalize(&output) != normalize(expected) {
+                failures.push(format!("Expected: {expected}\nActual: {output}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     #[test]
     fn blank_transcription_is_detected() {

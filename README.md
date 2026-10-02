@@ -52,6 +52,22 @@ The process is entirely local:
 
 For detailed build instructions including platform-specific requirements, see [BUILD.md](BUILD.md).
 
+### Japanese Dictation
+
+The **Japanese Dictation** prompt asks the model to remove fillers, repetitions, and abandoned wording from explicit self-corrections while preserving meaning, tone, technical terms, numbers, and questions.
+
+1. Select a multilingual transcription model and set its language to **Japanese**. Keep **Translate to English** off.
+2. Enable **Remove Filler Words** in Advanced settings.
+3. Enable **Experimental Features**, then **Post Processing**, in Advanced settings.
+4. Open Post Processing and select **Apple Intelligence** and the **Japanese Dictation** prompt.
+5. Set shortcut activation to **Hold** and assign `fn` to the post-processing shortcut. Keep the regular transcription shortcut distinct. If `fn` cannot be registered, select **Handy Keys** under Advanced > Keyboard Implementation.
+
+Apple Intelligence runs on-device on supported Apple Silicon Macs with macOS 26 or newer. Enable it in macOS settings first. Other providers send text to their configured API.
+
+Built-in Japanese filler removal requires punctuation or whitespace on both sides of the filler. It preserves pronouns such as `あの` and `その`, embedded words, and quoted fillers. AI cleanup handles the remaining text; its results depend on the selected model. Provider failures keep the transcription available. With the unedited Japanese preset, Handy also keeps the original if AI returns an empty result for text containing a quotation.
+
+For personal builds, turn off update checks to keep upstream releases from replacing your fork. See [BUILD.md](BUILD.md#personal-macos-build) for building without updater signing keys.
+
 ## Sponsors
 
 <div align="center">

@@ -322,6 +322,76 @@ fn gated_filler_words_for_language(lang: &str) -> &'static [&'static str] {
 
 static MULTI_SPACE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s{2,}").unwrap());
 
+static JAPANESE_FILLER_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"えー+っ?と|ええ?っと|ええと|あのー+|そのー+|うー+ん|あー+|えー+")
+        .expect("valid Japanese filler pattern")
+});
+
+static QUOTED_TEXT_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*""#).expect("valid quoted-text regex")
+});
+
+pub(crate) fn has_quoted_text(text: &str) -> bool {
+    QUOTED_TEXT_PATTERN.is_match(text)
+}
+
+fn is_japanese_pause(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '、' | '。'
+                | ','
+                | '.'
+                | '，'
+                | '．'
+                | '!'
+                | '?'
+                | '！'
+                | '？'
+                | ':'
+                | '：'
+                | ';'
+                | '；'
+                | '…'
+        )
+}
+
+fn remove_japanese_filler_matches(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut resume = 0;
+    let quoted_ranges: Vec<_> = QUOTED_TEXT_PATTERN
+        .find_iter(text)
+        .map(|quoted| quoted.range())
+        .collect();
+
+    for filler in JAPANESE_FILLER_PATTERN.find_iter(text) {
+        // A pause within a quotation is still part of the quoted speech.
+        if quoted_ranges
+            .iter()
+            .any(|range| range.start <= filler.start() && filler.end() <= range.end)
+        {
+            continue;
+        }
+        // Kana and kanji share Unicode word boundaries. Require an actual
+        // pause on both sides so embedded words and quoted fillers survive.
+        let before = text[..filler.start()].chars().next_back();
+        let after = text[filler.end()..].chars().next();
+        if !before.is_none_or(is_japanese_pause) || !after.is_none_or(is_japanese_pause) {
+            continue;
+        }
+
+        kept.push_str(&text[resume..filler.start()]);
+        resume = filler.end();
+        // The pause belonging to a deleted hesitation must not become a
+        // leading comma or an extra sentence break in the pasted text.
+        for c in text[resume..].chars().take_while(|c| is_japanese_pause(*c)) {
+            resume += c.len_utf8();
+        }
+    }
+    kept.push_str(&text[resume..]);
+    kept
+}
+
 /// Collapses repeated words (3+ repetitions) to a single instance.
 /// E.g., "wh wh wh wh" -> "wh", "I I I I" -> "I"
 fn collapse_stutters(text: &str) -> String {
@@ -411,8 +481,9 @@ fn remove_filler_matches(text: &str, pattern: &Regex) -> String {
 /// only removed when the output language is known. A custom list is an
 /// explicit user override and replaces both tiers without requiring language
 /// evidence. `Some(empty vec)` disables removal, preserving the legacy
-/// power-user setting. The master toggle takes precedence over both built-in
-/// and custom lists.
+/// power-user setting. Japanese defaults require pauses on both sides rather
+/// than Unicode word boundaries. The master toggle takes precedence over both
+/// built-in and custom lists.
 ///
 /// # Arguments
 /// * `text` - The raw transcription text to filter
@@ -455,6 +526,14 @@ pub fn remove_filler_words(
     let mut filtered = text.to_string();
     for pattern in &patterns {
         filtered = remove_filler_matches(&filtered, pattern);
+    }
+
+    if custom_filler_words.is_none()
+        && language
+            .language()
+            .is_some_and(|lang| lang.split(['-', '_']).next() == Some("ja"))
+    {
+        filtered = remove_japanese_filler_matches(&filtered);
     }
 
     filtered
@@ -640,6 +719,91 @@ mod tests {
         let text = "um I think um this is good";
         let result = filter_transcription_output(text, "en", &None);
         assert_eq!(result, "I think this is good");
+    }
+
+    #[test]
+    fn test_filter_japanese_fillers_at_pause_boundaries() {
+        // Japanese dictation has no spaces between words, so ASCII word
+        // boundaries leave even clearly separated hesitation words intact.
+        for (input, expected) in [
+            (
+                "えーっと、gRPCの場合は、Protoを中心に設計します。",
+                "gRPCの場合は、Protoを中心に設計します。",
+            ),
+            (
+                "えーと、ええと、ええっと、えっと、APIを使います。",
+                "APIを使います。",
+            ),
+            (
+                "今日は、あのー、そのー、APIを変更します。",
+                "今日は、APIを変更します。",
+            ),
+            ("うーん。あー、えー、分かりました。", "分かりました。"),
+            ("えーっと API を使います。", "API を使います。"),
+            ("えーっと、", ""),
+            (
+                "えーっと、「えーっと、あのー」と言います。",
+                "「えーっと、あのー」と言います。",
+            ),
+            (
+                "変更します。えーっと、次はテストです。",
+                "変更します。次はテストです。",
+            ),
+        ] {
+            let result = filter_transcription_output(input, "ja-JP", &None);
+            assert_eq!(result, expected, "{input}");
+            // Removing a pause must not expose a word that a later pass deletes.
+            assert_eq!(filter_transcription_output(&result, "ja-JP", &None), result);
+        }
+    }
+
+    #[test]
+    fn test_filter_japanese_preserves_words_and_quoted_fillers() {
+        // Deleting pronouns, adverbs, or quoted hesitation words changes the
+        // speaker's meaning. Embedded kana are not evidence of a pause.
+        for input in [
+            "あの人はその問題を直しました。まあ、それでいいと思います。",
+            "なんか違います。あーちゃんとうーんと考えました。",
+            "「えーっと」という言葉を残してください。",
+            "「えーっと、あのー、そのー、API」という発言です。",
+            "引用は\"えーっと、あのー、API\"です。",
+            "えーっと読む記号です。",
+            "コードはえっとAPIの中にあります。",
+        ] {
+            assert_eq!(filter_transcription_output(input, "ja", &None), input);
+        }
+    }
+
+    #[test]
+    fn test_filter_japanese_requires_language_evidence_and_respects_overrides() {
+        let input = "えーっと、APIを使います。";
+        // A UI locale alone must never delete words from an unrelated output
+        // language. Explicit custom lists and the master switch still win.
+        for evidence in [
+            OutputLanguageEvidence::UserSelected("ja".to_string()),
+            OutputLanguageEvidence::ModelDetected("ja".to_string()),
+            OutputLanguageEvidence::TextDetected("ja".to_string()),
+        ] {
+            assert_eq!(
+                remove_filler_words(input, &evidence, &None, true),
+                "APIを使います。"
+            );
+            assert_eq!(remove_filler_words(input, &evidence, &None, false), input);
+            assert_eq!(
+                remove_filler_words(input, &evidence, &Some(vec![]), true),
+                input
+            );
+            assert_eq!(
+                remove_filler_words(input, &evidence, &Some(vec!["okay".to_string()]), true),
+                input
+            );
+        }
+        for evidence in [
+            OutputLanguageEvidence::Unknown,
+            OutputLanguageEvidence::TranslatedToEnglish,
+        ] {
+            assert_eq!(remove_filler_words(input, &evidence, &None, true), input);
+        }
     }
 
     #[test]
